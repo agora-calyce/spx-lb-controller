@@ -1,0 +1,22 @@
+{{ template "chart.header" . }}
+
+{{ template "chart.versionBadge" . }}{{ template "chart.typeBadge" . }}{{ template "chart.appVersionBadge" . }}
+
+{{ template "chart.description" . }}
+
+{{ template "chart.maintainersSection" . }}
+
+{{ template "chart.requirementsSection" . }}
+
+{{ template "chart.valuesSection" . }}
+
+## Dev notes
+
+Developing this chart is done using helm plugins
+
+### Helm doc
+
+- https://github.com/norwoodj/helm-docs/tree/master
+
+This plugin allo to generate this readme using th `helm-docs .` command.  
+The doc can be configured by settings comments and @ keywords in the values.yaml file.
