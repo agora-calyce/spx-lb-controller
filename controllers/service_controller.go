@@ -79,8 +79,21 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
+	// An existing load balancer (created by the controller or referenced by the
+	// user through the lb-eid annotation) is read first: its VIP is reused
+	// when the lb-vip annotation is not set.
+	eid := service.Annotations[lbEIDAnnotation]
+	var lbInfo *api.LBFullResponse
+	if eid != "" {
+		var err error
+		if lbInfo, err = r.APIClient.GetLoadBalancer(eid); err != nil {
+			l.Error(err, "Failed to get load balancer info")
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Prepare API body
-	vip, err := r.getOrGenerateVIP(ctx, &service)
+	vip, err := r.getOrAdoptVIP(ctx, &service, lbInfo)
 	if err != nil {
 		l.Error(err, "Failed to get or generate VIP")
 		return ctrl.Result{}, err
@@ -98,8 +111,6 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	eid := service.Annotations[lbEIDAnnotation]
-	var lbInfo *api.LBFullResponse
 	if eid == "" {
 		// Create
 		l.Info("Creating external load balancer", "service", service.Name, "vip", vip)
@@ -119,11 +130,6 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	} else {
 		// Update only when the desired state differs from the external one
-		lbInfo, err = r.APIClient.GetLoadBalancer(eid)
-		if err != nil {
-			l.Error(err, "Failed to get load balancer info")
-			return ctrl.Result{}, err
-		}
 		if lbUpToDate(body, lbInfo) {
 			l.V(1).Info("External load balancer is up to date", "service", service.Name, "eid", eid)
 		} else {
@@ -403,6 +409,29 @@ func samePorts(a, b []api.RulePort) bool {
 		return keys
 	}
 	return slices.Equal(key(a), key(b))
+}
+
+// getOrAdoptVIP returns the VIP of the service: the lb-vip annotation if set,
+// otherwise the VIP of the existing load balancer (stored in the annotation so
+// that it stays stable), otherwise a new random VIP.
+func (r *ServiceReconciler) getOrAdoptVIP(ctx context.Context, service *corev1.Service, lbInfo *api.LBFullResponse) (string, error) {
+	if vip := service.Annotations[lbVIPAnnotation]; vip != "" {
+		return vip, nil
+	}
+	if lbInfo == nil || lbInfo.LoadBalancer.Spec.VIP == "" {
+		return r.getOrGenerateVIP(ctx, service)
+	}
+
+	vip := lbInfo.LoadBalancer.Spec.VIP
+	log.FromContext(ctx).Info("Reusing the VIP of the existing load balancer", "service", service.Name, "vip", vip)
+	if service.Annotations == nil {
+		service.Annotations = make(map[string]string)
+	}
+	service.Annotations[lbVIPAnnotation] = vip
+	if err := r.Update(ctx, service); err != nil {
+		return "", err
+	}
+	return vip, nil
 }
 
 func (r *ServiceReconciler) getOrGenerateVIP(ctx context.Context, service *corev1.Service) (string, error) {

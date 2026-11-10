@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -304,11 +305,13 @@ func TestLBUpToDate(t *testing.T) {
 	}
 }
 
-// fakeLBAPI serves GET and POST /load-balancer/{eid} and counts the updates.
+// fakeLBAPI serves GET and POST /load-balancer/{eid}, counts the updates and
+// applies them, so that the next GET returns the updated load balancer.
 type fakeLBAPI struct {
 	mu      sync.Mutex
 	current string
 	updates int
+	lastVIP string
 }
 
 func (f *fakeLBAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -323,7 +326,18 @@ func (f *fakeLBAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(f.current))
 	case http.MethodPost:
+		var body api.CreateLoadBalancerBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		f.updates++
+		f.lastVIP = body.Spec.VIP
+		updated := api.LBFullResponse{EID: "spx-lb-1", ProductName: body.General.ProductName}
+		updated.LoadBalancer.SubnetEID = body.Spec.SubnetEID
+		updated.LoadBalancer.Spec = body.Spec
+		data, _ := json.Marshal(updated)
+		f.current = string(data)
 		w.WriteHeader(http.StatusOK)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -333,6 +347,14 @@ func (f *fakeLBAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // reconcileFixtures returns an existing internal LoadBalancer service (already
 // created in the external API as spx-lb-1) with one ready endpoint on node-1.
 func reconcileFixtures(status corev1.ServiceStatus) []client.Object {
+	return reconcileFixturesWithAnnotations(status, map[string]string{
+		lbEIDAnnotation:     "spx-lb-1",
+		lbVIPAnnotation:     "198.18.1.2",
+		subnetEIDAnnotation: "spx-subnet-1",
+	})
+}
+
+func reconcileFixturesWithAnnotations(status corev1.ServiceStatus, annotations map[string]string) []client.Object {
 	nodeName := "node-1"
 	ready := true
 	return []client.Object{
@@ -342,14 +364,10 @@ func reconcileFixtures(status corev1.ServiceStatus) []client.Object {
 		},
 		&corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:       "web",
-				Namespace:  "default",
-				Finalizers: []string{lbFinalizer},
-				Annotations: map[string]string{
-					lbEIDAnnotation:     "spx-lb-1",
-					lbVIPAnnotation:     "198.18.1.2",
-					subnetEIDAnnotation: "spx-subnet-1",
-				},
+				Name:        "web",
+				Namespace:   "default",
+				Finalizers:  []string{lbFinalizer},
+				Annotations: annotations,
 			},
 			Spec: corev1.ServiceSpec{
 				Type:  corev1.ServiceTypeLoadBalancer,
@@ -383,12 +401,16 @@ func fakeLBJSON(endpoint string) string {
 // newReconcileTest builds a reconciler on the fixtures and a fake API, and counts
 // the status updates sent to Kubernetes.
 func newReconcileTest(t *testing.T, lbAPI *fakeLBAPI, status corev1.ServiceStatus) (*ServiceReconciler, client.Client, *int) {
+	return newReconcileTestWithObjects(t, lbAPI, reconcileFixtures(status))
+}
+
+func newReconcileTestWithObjects(t *testing.T, lbAPI *fakeLBAPI, objects []client.Object) (*ServiceReconciler, client.Client, *int) {
 	scheme := newTestScheme(t)
 	server := httptest.NewServer(lbAPI)
 	t.Cleanup(server.Close)
 
 	statusUpdates := 0
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(reconcileFixtures(status)...).
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).
 		WithStatusSubresource(&corev1.Service{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			SubResourceUpdate: func(ctx context.Context, c client.Client, subResource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
@@ -472,4 +494,83 @@ func TestReconcileUpdatesStatusOnlyWhenNeeded(t *testing.T) {
 			assert.Equal(t, tt.wantStatusUpdates, *statusUpdates)
 		})
 	}
+}
+
+func TestGetOrAdoptVIP(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+	existing := &api.LBFullResponse{}
+	existing.LoadBalancer.Spec.VIP = "198.18.250.10"
+
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		lbInfo      *api.LBFullResponse
+		want        string
+	}{
+		{name: "annotation wins over the existing LB", annotations: map[string]string{lbVIPAnnotation: "198.18.1.2"}, lbInfo: existing, want: "198.18.1.2"},
+		{name: "VIP of the existing LB is adopted", annotations: map[string]string{lbEIDAnnotation: "spx-lb-1"}, lbInfo: existing, want: "198.18.250.10"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default", Annotations: tt.annotations}}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(svc).Build()
+			r := &ServiceReconciler{Client: c}
+
+			vip, err := r.getOrAdoptVIP(ctx, svc, tt.lbInfo)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, vip)
+
+			var stored corev1.Service
+			require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(svc), &stored))
+			assert.Equal(t, tt.want, stored.Annotations[lbVIPAnnotation])
+		})
+	}
+
+	t.Run("no existing LB: random VIP in CIDR", func(t *testing.T) {
+		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"}}
+		r := &ServiceReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(svc).Build()}
+
+		vip, err := r.getOrAdoptVIP(ctx, svc, nil)
+		require.NoError(t, err)
+		_, ipnet, _ := net.ParseCIDR(vipCIDR)
+		assert.True(t, ipnet.Contains(net.ParseIP(vip)), "VIP %s should be in %s", vip, vipCIDR)
+	})
+}
+
+// A Service referencing an existing load balancer through lb-eid, without lb-vip,
+// must reuse the VIP of that load balancer and converge: an update loop with a
+// new random VIP on every reconciliation was hammering the API.
+func TestReconcileReusesExistingLB(t *testing.T) {
+	ctx := context.Background()
+	key := types.NamespacedName{Namespace: "default", Name: "web"}
+
+	existing := `{"eid": "spx-lb-1", "productName": "existing-lb", "loadBalancer": {"subnetEId": "spx-subnet-1",
+		"spec": {"vip": "198.18.250.10", "endpoints": ["10.0.0.99"], "ports": [{"port": 8080, "protocol": "TCP", "targetPort": 30999}]}}}`
+	lbAPI := &fakeLBAPI{current: existing}
+	r, c, statusUpdates := newReconcileTestWithObjects(t, lbAPI, reconcileFixturesWithAnnotations(corev1.ServiceStatus{},
+		map[string]string{lbEIDAnnotation: "spx-lb-1", subnetEIDAnnotation: "spx-subnet-1"}))
+
+	for i := 0; i < 3; i++ {
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		require.NoError(t, err)
+	}
+
+	assert.Equal(t, 1, lbAPI.updates, "the existing LB must be updated once, then be up to date")
+	assert.Equal(t, "198.18.250.10", lbAPI.lastVIP, "the VIP of the existing LB must be kept")
+	assert.Equal(t, 1, *statusUpdates)
+
+	var svc corev1.Service
+	require.NoError(t, c.Get(ctx, key, &svc))
+	assert.Equal(t, "spx-lb-1", svc.Annotations[lbEIDAnnotation])
+	assert.Equal(t, "198.18.250.10", svc.Annotations[lbVIPAnnotation])
+	require.Len(t, svc.Status.LoadBalancer.Ingress, 1)
+	assert.Equal(t, "198.18.250.10", svc.Status.LoadBalancer.Ingress[0].IP)
+
+	var current api.LBFullResponse
+	require.NoError(t, json.Unmarshal([]byte(lbAPI.current), &current))
+	assert.Equal(t, "k8s-lb-default-web", current.ProductName)
+	assert.Equal(t, []string{"10.0.0.11"}, current.LoadBalancer.Spec.Endpoints)
+	assert.Equal(t, []api.RulePort{{Port: 80, Protocol: "TCP", TargetPort: 30080}}, current.LoadBalancer.Spec.Ports)
 }

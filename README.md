@@ -42,7 +42,8 @@ The controller uses several annotations on `Service` resources of type `LoadBala
 | Annotation | Possible values | Default | Description |
 |------------|-----------------|---------|-------------|
 | `superphenix.net/lb-expose` | `internal`, `public` | `internal` | Defines whether the service must be exposed publicly through an EIP (External IP) or remain internal. |
-| `superphenix.net/lb-vip` | IP (CIDR `198.18.0.0/16`) | Auto-generated | Sets a fixed VIP address for the load balancer. If not set, an IP is picked at random in the `198.18.0.0/16` block. |
+| `superphenix.net/lb-vip` | IP (CIDR `198.18.0.0/16`) | Auto-generated | Sets a fixed VIP address for the load balancer. If not set, the VIP of the reused load balancer is kept (see `lb-eid`), otherwise an IP is picked at random in the `198.18.0.0/16` block. |
+| `superphenix.net/lb-eid` | EID of an existing SPX load balancer | Set by the controller | Reuses an existing load balancer instead of creating a new one (see [Reusing an existing load balancer](#reusing-an-existing-load-balancer)). |
 
 ### Status annotations (managed automatically)
 
@@ -50,7 +51,7 @@ These annotations are added by the controller and must not be modified manually 
 
 | Annotation | Description |
 |------------|-------------|
-| `superphenix.net/lb-eid` | Unique identifier (EID) of the LoadBalancer created in the external API. |
+| `superphenix.net/lb-eid` | Unique identifier (EID) of the LoadBalancer created (or reused) in the external API. |
 | `superphenix.net/subnet-eid` | Subnet identifier (`spx-` + UUID v5) computed from the cluster info and used to create the load balancer and the EIP. |
 | `cluster.x-k8s.io/cluster-name` | Annotation present on Nodes, used to retrieve the cluster identifier. |
 | `cluster.x-k8s.io/cluster-namespace` | Annotation present on Nodes, used to retrieve the ProjectID (after removing the `spx-` prefix) at startup. The controller exits with an error if no Node, no annotation or no valid UUID is found. |
@@ -78,6 +79,14 @@ Once assigned (either through the manual annotation or automatic generation), it
 ### Updates
 The controller reconciles a service on every change of the service or of its EndpointSlices. It only sends an update to the SPX API when the external load balancer differs from the desired state: product name, VIP, subnet, endpoints (Node internal IPs) or ports (port, protocol, NodePort), compared regardless of their order.
 The service status (`.status.loadBalancer.ingress`) is only written when its IP changes.
+
+### Reusing an existing load balancer
+Setting `superphenix.net/lb-eid` on a new Service makes the controller adopt that load balancer instead of creating one:
+- its VIP is kept (and stored in `superphenix.net/lb-vip`), unless `superphenix.net/lb-vip` is set;
+- its product name, endpoints and ports are then updated to match the Service, like for any managed load balancer;
+- it is **deleted with the Service**, as the controller then owns it.
+
+In `public` mode, an EIP is created unless `superphenix.net/eip-eid` is also set.
 
 ### Cleanup
 When the Kubernetes service is deleted, or if its type changes and it is no longer a `LoadBalancer`, the controller automatically deletes the associated resources (LoadBalancer and EIP) in the external API.

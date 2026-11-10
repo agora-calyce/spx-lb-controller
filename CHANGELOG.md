@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+- Fix an update loop when a Service references an existing load balancer through `superphenix.net/lb-eid` without `superphenix.net/lb-vip`: a new random VIP was generated on every reconciliation, overwriting the VIP of the load balancer and updating it continuously. The VIP of the existing load balancer is now reused and stored in `superphenix.net/lb-vip`.
+- Document the reuse of an existing load balancer through the `superphenix.net/lb-eid` annotation.
+
 ## [v0.1.2]
 - Only write the service status when its ingress IP changes, instead of on every reconciliation, and log it (`Service status updated`).
 - Log `EIP is ready` at debug level only, as it was repeated on every reconciliation.
