@@ -24,7 +24,7 @@ Kubernetes: `>=1.33.0-0`
 | api.existingSecret | string | `""` | Optional: reference an existing secret for the configuration If existingSecret is provided, url, token, orgaId and az from values are ignored |
 | api.orgaId | string | `""` | Organisation ID |
 | api.token | string | `""` | API endpoint access token |
-| api.url | string | `"https://api.superphenix.net"` | API endpoint base url |
+| api.url | string | `"https://console.agoracalyce.com/api"` | API endpoint base url |
 
 ### Controller settings
 
