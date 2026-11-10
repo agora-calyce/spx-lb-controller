@@ -75,5 +75,8 @@ The controller uses the first subnet of the first group of the cluster (`kaas/{c
 The VIP is the internal IP address of the load balancer. It must be within the `198.18.0.0/16` CIDR.
 Once assigned (either through the manual annotation or automatic generation), it is stored in the service annotations and never changes during the lifecycle of the external resource.
 
+### Updates
+The controller reconciles a service on every change of the service or of its EndpointSlices. It only sends an update to the SPX API when the external load balancer differs from the desired state: product name, VIP, subnet, endpoints (Node internal IPs) or ports (port, protocol, NodePort), compared regardless of their order.
+
 ### Cleanup
 When the Kubernetes service is deleted, or if its type changes and it is no longer a `LoadBalancer`, the controller automatically deletes the associated resources (LoadBalancer and EIP) in the external API.

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -97,6 +99,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	eid := service.Annotations[lbEIDAnnotation]
+	var lbInfo *api.LBFullResponse
 	if eid == "" {
 		// Create
 		l.Info("Creating external load balancer", "service", service.Name, "vip", vip)
@@ -115,19 +118,31 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 	} else {
-		// Update
-		l.Info("Updating external load balancer", "service", service.Name, "eid", eid)
-		if err := r.APIClient.UpdateLoadBalancer(eid, body); err != nil {
-			l.Error(err, "Failed to update external load balancer")
+		// Update only when the desired state differs from the external one
+		lbInfo, err = r.APIClient.GetLoadBalancer(eid)
+		if err != nil {
+			l.Error(err, "Failed to get load balancer info")
 			return ctrl.Result{}, err
+		}
+		if lbUpToDate(body, lbInfo) {
+			l.V(1).Info("External load balancer is up to date", "service", service.Name, "eid", eid)
+		} else {
+			l.Info("Updating external load balancer", "service", service.Name, "eid", eid)
+			if err := r.APIClient.UpdateLoadBalancer(eid, body); err != nil {
+				l.Error(err, "Failed to update external load balancer")
+				return ctrl.Result{}, err
+			}
+			lbInfo = nil
 		}
 	}
 
-	// Always get the latest LB info to have the actual VIP
-	lbInfo, err := r.APIClient.GetLoadBalancer(eid)
-	if err != nil {
-		l.Error(err, "Failed to get load balancer info")
-		return ctrl.Result{}, err
+	// Get the latest LB info (after a creation or an update) to have the actual VIP
+	if lbInfo == nil {
+		lbInfo, err = r.APIClient.GetLoadBalancer(eid)
+		if err != nil {
+			l.Error(err, "Failed to get load balancer info")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Handle EIP for public exposure
@@ -340,8 +355,46 @@ func (r *ServiceReconciler) prepareLBBody(ctx context.Context, service *corev1.S
 	for ip := range nodeIPs {
 		body.Spec.Endpoints = append(body.Spec.Endpoints, ip)
 	}
+	// Map iteration order is random: keep the body deterministic
+	slices.Sort(body.Spec.Endpoints)
 
 	return body, nil
+}
+
+// lbUpToDate reports whether the external load balancer already matches the
+// desired body, so that no update is needed. Endpoints and ports are compared
+// regardless of their order. The subnet is only compared when the API reports it.
+func lbUpToDate(desired api.CreateLoadBalancerBody, current *api.LBFullResponse) bool {
+	cur := current.LoadBalancer.Spec
+	if current.ProductName != desired.General.ProductName || cur.VIP != desired.Spec.VIP {
+		return false
+	}
+
+	currentSubnet := current.LoadBalancer.SubnetEID
+	if currentSubnet == "" {
+		currentSubnet = cur.SubnetEID
+	}
+	if currentSubnet != "" && currentSubnet != desired.Spec.SubnetEID {
+		return false
+	}
+
+	return sameStrings(cur.Endpoints, desired.Spec.Endpoints) && samePorts(cur.Ports, desired.Spec.Ports)
+}
+
+func sameStrings(a, b []string) bool {
+	return slices.Equal(slices.Sorted(slices.Values(a)), slices.Sorted(slices.Values(b)))
+}
+
+func samePorts(a, b []api.RulePort) bool {
+	key := func(ports []api.RulePort) []string {
+		keys := make([]string, 0, len(ports))
+		for _, p := range ports {
+			keys = append(keys, fmt.Sprintf("%d/%s/%d", p.Port, strings.ToUpper(p.Protocol), p.TargetPort))
+		}
+		slices.Sort(keys)
+		return keys
+	}
+	return slices.Equal(key(a), key(b))
 }
 
 func (r *ServiceReconciler) getOrGenerateVIP(ctx context.Context, service *corev1.Service) (string, error) {

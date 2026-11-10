@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -15,9 +16,11 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"spx-lb-controller/pkg/api"
 )
@@ -199,4 +202,213 @@ func TestPrepareLBBody(t *testing.T) {
 	assert.Equal(t, "spx-subnet-1", body.Spec.SubnetEID)
 	assert.Equal(t, []string{"10.0.0.11"}, body.Spec.Endpoints)
 	assert.Equal(t, []api.RulePort{{Port: 80, Protocol: "TCP", TargetPort: 30080}}, body.Spec.Ports)
+}
+
+func TestPrepareLBBodySortsEndpoints(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	ready := true
+	objs := []client.Object{
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+		},
+	}
+	var endpoints []discoveryv1.Endpoint
+	for i, ip := range []string{"10.0.0.13", "10.0.0.11", "10.0.0.12"} {
+		name := fmt.Sprintf("node-%d", i)
+		objs = append(objs, &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status:     corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: ip}}},
+		})
+		endpoints = append(endpoints, discoveryv1.Endpoint{
+			Addresses:  []string{fmt.Sprintf("172.16.0.%d", i)},
+			NodeName:   &name,
+			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+		})
+	}
+	objs = append(objs, &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-abc",
+			Namespace: "default",
+			Labels:    map[string]string{"kubernetes.io/service-name": "web"},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints:   endpoints,
+	})
+
+	r := &ServiceReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()}
+
+	body, err := r.prepareLBBody(ctx, objs[0].(*corev1.Service), "198.18.1.2", "spx-subnet-1")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"10.0.0.11", "10.0.0.12", "10.0.0.13"}, body.Spec.Endpoints)
+}
+
+func TestLBUpToDate(t *testing.T) {
+	desired := api.CreateLoadBalancerBody{}
+	desired.General.ProductName = "k8s-lb-default-web"
+	desired.Spec = api.LoadBalancerSpec{
+		VIP:       "198.18.1.2",
+		SubnetEID: "spx-subnet-1",
+		Endpoints: []string{"10.0.0.11", "10.0.0.12"},
+		Ports: []api.RulePort{
+			{Port: 80, Protocol: "TCP", TargetPort: 30080},
+			{Port: 443, Protocol: "TCP", TargetPort: 30443},
+		},
+	}
+
+	matching := func() *api.LBFullResponse {
+		current := &api.LBFullResponse{ProductName: "k8s-lb-default-web"}
+		current.LoadBalancer.SubnetEID = "spx-subnet-1"
+		current.LoadBalancer.Spec = api.LoadBalancerSpec{
+			VIP:       "198.18.1.2",
+			Endpoints: []string{"10.0.0.12", "10.0.0.11"},
+			Ports: []api.RulePort{
+				{Port: 443, Protocol: "tcp", TargetPort: 30443},
+				{Port: 80, Protocol: "TCP", TargetPort: 30080},
+			},
+		}
+		return current
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*api.LBFullResponse)
+		want   bool
+	}{
+		{name: "same state in another order", mutate: func(*api.LBFullResponse) {}, want: true},
+		{name: "subnet not reported by the API", mutate: func(c *api.LBFullResponse) { c.LoadBalancer.SubnetEID = "" }, want: true},
+		{name: "subnet reported in spec", mutate: func(c *api.LBFullResponse) {
+			c.LoadBalancer.SubnetEID = ""
+			c.LoadBalancer.Spec.SubnetEID = "spx-subnet-1"
+		}, want: true},
+		{name: "different product name", mutate: func(c *api.LBFullResponse) { c.ProductName = "other" }, want: false},
+		{name: "different VIP", mutate: func(c *api.LBFullResponse) { c.LoadBalancer.Spec.VIP = "198.18.1.3" }, want: false},
+		{name: "different subnet", mutate: func(c *api.LBFullResponse) { c.LoadBalancer.SubnetEID = "spx-subnet-2" }, want: false},
+		{name: "missing endpoint", mutate: func(c *api.LBFullResponse) { c.LoadBalancer.Spec.Endpoints = []string{"10.0.0.11"} }, want: false},
+		{name: "different endpoint", mutate: func(c *api.LBFullResponse) {
+			c.LoadBalancer.Spec.Endpoints = []string{"10.0.0.11", "10.0.0.13"}
+		}, want: false},
+		{name: "different node port", mutate: func(c *api.LBFullResponse) { c.LoadBalancer.Spec.Ports[1].TargetPort = 30081 }, want: false},
+		{name: "missing port", mutate: func(c *api.LBFullResponse) { c.LoadBalancer.Spec.Ports = c.LoadBalancer.Spec.Ports[:1] }, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			current := matching()
+			tt.mutate(current)
+			assert.Equal(t, tt.want, lbUpToDate(desired, current))
+		})
+	}
+}
+
+// fakeLBAPI serves GET and POST /load-balancer/{eid} and counts the updates.
+type fakeLBAPI struct {
+	mu      sync.Mutex
+	current string
+	updates int
+}
+
+func (f *fakeLBAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r.URL.Path != fmt.Sprintf("/org-1/api/spx-ctrl/az-1/%s/load-balancer/spx-lb-1", testProjectID) {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(f.current))
+	case http.MethodPost:
+		f.updates++
+		w.WriteHeader(http.StatusOK)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func TestReconcileUpdatesLBOnlyWhenNeeded(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	nodeName := "node-1"
+	ready := true
+	newObjects := func() []client.Object {
+		return []client.Object{
+			&corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+				Status:     corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.11"}}},
+			},
+			&corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "web",
+					Namespace:  "default",
+					Finalizers: []string{lbFinalizer},
+					Annotations: map[string]string{
+						lbEIDAnnotation:     "spx-lb-1",
+						lbVIPAnnotation:     "198.18.1.2",
+						subnetEIDAnnotation: "spx-subnet-1",
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Port: 80, NodePort: 30080, Protocol: corev1.ProtocolTCP}},
+				},
+			},
+			&discoveryv1.EndpointSlice{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "web-abc",
+					Namespace: "default",
+					Labels:    map[string]string{"kubernetes.io/service-name": "web"},
+				},
+				AddressType: discoveryv1.AddressTypeIPv4,
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses:  []string{"172.16.0.5"},
+					NodeName:   &nodeName,
+					Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+				}},
+			},
+		}
+	}
+	lbJSON := func(endpoint string) string {
+		return fmt.Sprintf(`{"eid": "spx-lb-1", "productName": "k8s-lb-default-web", "loadBalancer": {"subnetEId": "spx-subnet-1",
+			"spec": {"vip": "198.18.1.2", "endpoints": [%q], "ports": [{"name": "80-30080-tcp", "port": 80, "protocol": "TCP", "targetPort": 30080}]}}}`, endpoint)
+	}
+
+	tests := []struct {
+		name        string
+		endpoint    string
+		wantUpdates int
+	}{
+		{name: "up to date", endpoint: "10.0.0.11", wantUpdates: 0},
+		{name: "endpoints changed", endpoint: "10.0.0.99", wantUpdates: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lbAPI := &fakeLBAPI{current: lbJSON(tt.endpoint)}
+			server := httptest.NewServer(lbAPI)
+			defer server.Close()
+
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(newObjects()...).
+				WithStatusSubresource(&corev1.Service{}).Build()
+			r := &ServiceReconciler{
+				Client:    c,
+				Scheme:    scheme,
+				APIClient: api.NewClient(server.URL, "token", "org-1", "az-1", testProjectID, false),
+			}
+
+			key := types.NamespacedName{Namespace: "default", Name: "web"}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantUpdates, lbAPI.updates)
+
+			var svc corev1.Service
+			require.NoError(t, c.Get(ctx, key, &svc))
+			require.Len(t, svc.Status.LoadBalancer.Ingress, 1)
+			assert.Equal(t, "198.18.1.2", svc.Status.LoadBalancer.Ingress[0].IP)
+		})
+	}
 }
