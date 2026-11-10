@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [v0.1.2]
 - Only write the service status when its ingress IP changes, instead of on every reconciliation, and log it (`Service status updated`).
 - Log `EIP is ready` at debug level only, as it was repeated on every reconciliation.
 
