@@ -1,0 +1,11 @@
+Get the controller logs:
+
+  kubectl logs -n {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "spx-lb-controller.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -f
+
+Check the status of the controller:
+
+  kubectl get pods -n {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "spx-lb-controller.name" . }},app.kubernetes.io/instance={{ .Release.Name }}"
+
+Metrics service address:
+
+  {{ include "spx-lb-controller.fullname" . }}-metrics.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.metrics.service.port }}

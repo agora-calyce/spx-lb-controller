@@ -1,0 +1,117 @@
+# Default values for spx-lb-controller.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# -- To use multiple replicas, ensure `.controller.leaderElect: true` is set
+replicaCount: 1
+
+# -- Image config
+image:
+  # -- Image to use for the controller
+  repository: ghcr.io/agora-calyce/spx-lb-controller
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+# -- Image pull secrets if private repositiry is used
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# @section -- Service account
+serviceAccount:
+  # -- Specifies whether a service account should be created
+  # @section -- Service account
+  create: true
+  # -- Annotations to add to the service account
+  # @section -- Service account
+  annotations: {}
+  # -- The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  # @section -- Service account
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  # fsGroup: 2000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: true
+  runAsUser: 65532
+  runAsGroup: 65532
+
+# @section -- API Configuration
+api:
+  # -- API endpoint base url
+  # @section -- API Configuration
+  url: "https://console.agoracalyce.com/api"
+  # -- API endpoint access token
+  # @section -- API Configuration
+  token: ""
+  # -- Organisation ID
+  # @section -- API Configuration
+  orgaId: ""
+  # -- AZ Code (lowercase)
+  # @section -- API Configuration
+  az: ""
+  # -- Optional: reference an existing secret for the configuration
+  # If existingSecret is provided, url, token, orgaId and az from values are ignored
+  # @section -- API Configuration
+  existingSecret: ""
+
+# @section -- Controller settings
+controller:
+  # -- Ensure a leader is elected, mandatory to have more than one replicas
+  # @section -- Controller settings
+  leaderElect: false
+  # -- Metrics port
+  # @section -- Controller settings
+  metricsAddr: ":8080"
+  # -- Probes port
+  # @section -- Controller settings
+  probeAddr: ":8081"
+  # -- Log level for the controller
+  # @section -- Controller settings
+  logLevel: "info" # debug, info, error
+  # -- True to display all api requests/response
+  # @section -- Controller settings
+  debug: false
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 128Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+metrics:
+  service:
+    type: ClusterIP
+    port: 8080
+
+# -- Extra secrets to create
+# @section -- Extras
+extraSecrets: []
+#  - name: extra-secret-1
+#    type: Opaque
+#    data:
+#      key1: value1
+#      key2: value2
+#  - name: extra-secret-2
+#    stringData:
+#      key3: value3

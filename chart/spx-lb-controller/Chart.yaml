@@ -1,0 +1,10 @@
+apiVersion: v2
+name: spx-lb-controller
+description: A Helm chart for Kubernetes LoadBalancer controller for SPX KaaS
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.33.0-0"
+maintainers:
+  - name: Sébastien SCHMITT
+    email: sebastien.schmitt@agoracalyce.com

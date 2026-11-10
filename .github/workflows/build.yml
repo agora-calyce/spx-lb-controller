@@ -1,0 +1,205 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Artifacts are published on GitHub, with the built-in GITHUB_TOKEN (no secret to configure):
+# - image: ghcr.io/<owner>/spx-lb-controller ("latest" on main, chart version on tags)
+# - chart: oci://ghcr.io/<owner>/charts/spx-lb-controller and attached to the GitHub Release (tags only)
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # Formatting, modules, vet and golangci-lint
+  lint-go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Files not formatted with gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Check go.mod / go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.6.1
+
+  # Unit tests with the race detector
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+  # Helm chart lint, rendering and generated docs
+  lint-chart:
+    runs-on: ubuntu-latest
+    env:
+      CHART_DIR: chart/spx-lb-controller
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: helm lint --strict "$CHART_DIR"
+
+      - name: Render chart
+        run: helm template spx-lb-controller "$CHART_DIR" > /dev/null
+
+      - name: Check chart README is up to date (helm-docs)
+        run: |
+          go install github.com/norwoodj/helm-docs/cmd/helm-docs@v1.14.2
+          helm-docs --chart-search-root chart
+          if ! git diff --exit-code -- chart; then
+            echo "Chart README is outdated: run helm-docs and commit the result."
+            exit 1
+          fi
+
+  # Dockerfile best practices
+  lint-dockerfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+  # On tags only: the git tag (without a leading "v") must match the chart version and appVersion
+  check-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check chart version matches tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CHART=chart/spx-lb-controller/Chart.yaml
+          VERSION=$(sed -n 's/^version: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CHART")
+          APP_VERSION=$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CHART")
+          echo "tag=$TAG version=$VERSION appVersion=$APP_VERSION"
+          if [ "$TAG" != "$VERSION" ] || [ "$TAG" != "$APP_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Chart.yaml version/appVersion."
+            exit 1
+          fi
+
+  # Build the Docker image, and push it to GHCR on main and tags
+  build-image:
+    needs: [lint-go, test, lint-chart, lint-dockerfile, check-release]
+    # check-release is skipped outside tags
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # "latest" on the default branch; on tags, the version without leading "v"
+      # (it must match the chart appVersion, used as default image tag)
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/spx-lb-controller
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=ref,event=pr
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # On tags only: push the Helm chart to GHCR (OCI) and create the GitHub Release with the chart attached
+  release:
+    needs: [build-image]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      CHART_DIR: chart/spx-lb-controller
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Package chart
+        run: helm package "$CHART_DIR"
+
+      - name: Push chart to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          echo "$GITHUB_TOKEN" | helm registry login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+          # The package name will be spx-lb-controller-X.Y.Z.tgz
+          PACKAGE_FILE=$(ls spx-lb-controller-*.tgz)
+          # OCI references must be lowercase
+          helm push "$PACKAGE_FILE" "oci://$REGISTRY/${OWNER,,}/charts"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" spx-lb-controller-*.tgz \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag

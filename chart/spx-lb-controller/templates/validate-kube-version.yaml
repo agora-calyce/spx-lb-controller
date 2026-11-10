@@ -1,0 +1,3 @@
+{{- if not (semverCompare ">=1.33.0-0" .Capabilities.KubeVersion.Version) -}}
+{{- fail (printf "This chart requires Kubernetes v1.33.0 or later. Current cluster version is %s" .Capabilities.KubeVersion.Version) -}}
+{{- end -}}

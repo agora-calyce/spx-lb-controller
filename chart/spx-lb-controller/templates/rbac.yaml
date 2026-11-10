@@ -1,0 +1,46 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "spx-lb-controller.fullname" . }}
+  labels:
+    {{- include "spx-lb-controller.labels" . | nindent 4 }}
+rules:
+  # Permissions for the controller to manage Services and EndpointSlices
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services/finalizers"]
+    verbs: ["update"]
+  # Permissions for events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # Permissions for leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "spx-lb-controller.fullname" . }}
+  labels:
+    {{- include "spx-lb-controller.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "spx-lb-controller.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "spx-lb-controller.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

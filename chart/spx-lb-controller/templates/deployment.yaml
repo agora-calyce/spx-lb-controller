@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "spx-lb-controller.fullname" . }}
+  labels:
+    {{- include "spx-lb-controller.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.controller.leaderElect }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "spx-lb-controller.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "spx-lb-controller.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "spx-lb-controller.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--metrics-bind-address={{ .Values.controller.metricsAddr }}"
+            - "--health-probe-bind-address={{ .Values.controller.probeAddr }}"
+            {{- if .Values.controller.leaderElect }}
+            - "--leader-elect"
+            {{- end }}
+            - "--zap-log-level={{ .Values.controller.logLevel }}"
+            {{- if .Values.controller.debug }}
+            - "--debug"
+            {{- end }}
+          env:
+            - name: API_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.existingSecret | default (printf "%s-api" (include "spx-lb-controller.fullname" .)) }}
+                  key: url
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.existingSecret | default (printf "%s-api" (include "spx-lb-controller.fullname" .)) }}
+                  key: token
+            - name: API_ORGA_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.existingSecret | default (printf "%s-api" (include "spx-lb-controller.fullname" .)) }}
+                  key: orgaId
+            - name: API_AZ
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.existingSecret | default (printf "%s-api" (include "spx-lb-controller.fullname" .)) }}
+                  key: az
+          ports:
+            - name: metrics
+              containerPort: {{ (split ":" .Values.controller.metricsAddr)._1 | default 8080 | int }}
+              protocol: TCP
+            - name: health
+              containerPort: {{ (split ":" .Values.controller.probeAddr)._1 | default 8081 | int }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

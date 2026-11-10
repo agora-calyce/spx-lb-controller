@@ -1,0 +1,9 @@
+# Directories
+bin/
+doc/
+.git/
+chart/
+
+# Other
+*.md
+.gitignore
