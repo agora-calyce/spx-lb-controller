@@ -194,12 +194,3 @@ jobs:
           PACKAGE_FILE=$(ls spx-lb-controller-*.tgz)
           # OCI references must be lowercase
           helm push "$PACKAGE_FILE" "oci://$REGISTRY/${OWNER,,}/charts"
-
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" spx-lb-controller-*.tgz \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            --verify-tag
