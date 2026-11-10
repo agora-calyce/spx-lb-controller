@@ -188,7 +188,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 
 		ingressIP = eipInfo.ExternalIP()
-		l.Info("EIP is ready", "service", service.Name, "externalIP", ingressIP)
+		l.V(1).Info("EIP is ready", "service", service.Name, "externalIP", ingressIP)
 	} else {
 		// Not public, if EIP exists, delete it
 		if eipEID != "" {
@@ -207,8 +207,8 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		ingressIP = lbInfo.LoadBalancer.Spec.VIP
 	}
 
-	// Update status with determined IP
-	if ingressIP != "" {
+	// Update status with determined IP, only when it changed
+	if ingressIP != "" && !hasIngressIP(&service, ingressIP) {
 		service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{
 			{IP: ingressIP},
 		}
@@ -216,6 +216,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			l.Error(err, "Failed to update service status")
 			return ctrl.Result{}, err
 		}
+		l.Info("Service status updated", "service", service.Name, "ingressIP", ingressIP)
 	}
 
 	return ctrl.Result{}, nil
@@ -379,6 +380,13 @@ func lbUpToDate(desired api.CreateLoadBalancerBody, current *api.LBFullResponse)
 	}
 
 	return sameStrings(cur.Endpoints, desired.Spec.Endpoints) && samePorts(cur.Ports, desired.Spec.Ports)
+}
+
+// hasIngressIP reports whether the service status already holds ip as its only
+// ingress. Only the IP is compared: the API server defaults other fields (ipMode).
+func hasIngressIP(service *corev1.Service, ip string) bool {
+	ingress := service.Status.LoadBalancer.Ingress
+	return len(ingress) == 1 && ingress[0].IP == ip
 }
 
 func sameStrings(a, b []string) bool {

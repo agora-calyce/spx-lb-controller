@@ -20,6 +20,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"spx-lb-controller/pkg/api"
@@ -329,53 +330,82 @@ func (f *fakeLBAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func TestReconcileUpdatesLBOnlyWhenNeeded(t *testing.T) {
-	ctx := context.Background()
-	scheme := newTestScheme(t)
-
+// reconcileFixtures returns an existing internal LoadBalancer service (already
+// created in the external API as spx-lb-1) with one ready endpoint on node-1.
+func reconcileFixtures(status corev1.ServiceStatus) []client.Object {
 	nodeName := "node-1"
 	ready := true
-	newObjects := func() []client.Object {
-		return []client.Object{
-			&corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: nodeName},
-				Status:     corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.11"}}},
-			},
-			&corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:       "web",
-					Namespace:  "default",
-					Finalizers: []string{lbFinalizer},
-					Annotations: map[string]string{
-						lbEIDAnnotation:     "spx-lb-1",
-						lbVIPAnnotation:     "198.18.1.2",
-						subnetEIDAnnotation: "spx-subnet-1",
-					},
-				},
-				Spec: corev1.ServiceSpec{
-					Type:  corev1.ServiceTypeLoadBalancer,
-					Ports: []corev1.ServicePort{{Port: 80, NodePort: 30080, Protocol: corev1.ProtocolTCP}},
+	return []client.Object{
+		&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+			Status:     corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.11"}}},
+		},
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "web",
+				Namespace:  "default",
+				Finalizers: []string{lbFinalizer},
+				Annotations: map[string]string{
+					lbEIDAnnotation:     "spx-lb-1",
+					lbVIPAnnotation:     "198.18.1.2",
+					subnetEIDAnnotation: "spx-subnet-1",
 				},
 			},
-			&discoveryv1.EndpointSlice{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "web-abc",
-					Namespace: "default",
-					Labels:    map[string]string{"kubernetes.io/service-name": "web"},
-				},
-				AddressType: discoveryv1.AddressTypeIPv4,
-				Endpoints: []discoveryv1.Endpoint{{
-					Addresses:  []string{"172.16.0.5"},
-					NodeName:   &nodeName,
-					Conditions: discoveryv1.EndpointConditions{Ready: &ready},
-				}},
+			Spec: corev1.ServiceSpec{
+				Type:  corev1.ServiceTypeLoadBalancer,
+				Ports: []corev1.ServicePort{{Port: 80, NodePort: 30080, Protocol: corev1.ProtocolTCP}},
 			},
-		}
+			Status: status,
+		},
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "web-abc",
+				Namespace: "default",
+				Labels:    map[string]string{"kubernetes.io/service-name": "web"},
+			},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints: []discoveryv1.Endpoint{{
+				Addresses:  []string{"172.16.0.5"},
+				NodeName:   &nodeName,
+				Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+			}},
+		},
 	}
-	lbJSON := func(endpoint string) string {
-		return fmt.Sprintf(`{"eid": "spx-lb-1", "productName": "k8s-lb-default-web", "loadBalancer": {"subnetEId": "spx-subnet-1",
-			"spec": {"vip": "198.18.1.2", "endpoints": [%q], "ports": [{"name": "80-30080-tcp", "port": 80, "protocol": "TCP", "targetPort": 30080}]}}}`, endpoint)
+}
+
+// fakeLBJSON is the GET /load-balancer/spx-lb-1 response matching reconcileFixtures,
+// except for the given endpoint.
+func fakeLBJSON(endpoint string) string {
+	return fmt.Sprintf(`{"eid": "spx-lb-1", "productName": "k8s-lb-default-web", "loadBalancer": {"subnetEId": "spx-subnet-1",
+		"spec": {"vip": "198.18.1.2", "endpoints": [%q], "ports": [{"name": "80-30080-tcp", "port": 80, "protocol": "TCP", "targetPort": 30080}]}}}`, endpoint)
+}
+
+// newReconcileTest builds a reconciler on the fixtures and a fake API, and counts
+// the status updates sent to Kubernetes.
+func newReconcileTest(t *testing.T, lbAPI *fakeLBAPI, status corev1.ServiceStatus) (*ServiceReconciler, client.Client, *int) {
+	scheme := newTestScheme(t)
+	server := httptest.NewServer(lbAPI)
+	t.Cleanup(server.Close)
+
+	statusUpdates := 0
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(reconcileFixtures(status)...).
+		WithStatusSubresource(&corev1.Service{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				statusUpdates++
+				return c.SubResource(subResource).Update(ctx, obj, opts...)
+			},
+		}).Build()
+	r := &ServiceReconciler{
+		Client:    c,
+		Scheme:    scheme,
+		APIClient: api.NewClient(server.URL, "token", "org-1", "az-1", testProjectID, false),
 	}
+	return r, c, &statusUpdates
+}
+
+func TestReconcileUpdatesLBOnlyWhenNeeded(t *testing.T) {
+	ctx := context.Background()
 
 	tests := []struct {
 		name        string
@@ -388,17 +418,8 @@ func TestReconcileUpdatesLBOnlyWhenNeeded(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			lbAPI := &fakeLBAPI{current: lbJSON(tt.endpoint)}
-			server := httptest.NewServer(lbAPI)
-			defer server.Close()
-
-			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(newObjects()...).
-				WithStatusSubresource(&corev1.Service{}).Build()
-			r := &ServiceReconciler{
-				Client:    c,
-				Scheme:    scheme,
-				APIClient: api.NewClient(server.URL, "token", "org-1", "az-1", testProjectID, false),
-			}
+			lbAPI := &fakeLBAPI{current: fakeLBJSON(tt.endpoint)}
+			r, c, _ := newReconcileTest(t, lbAPI, corev1.ServiceStatus{})
 
 			key := types.NamespacedName{Namespace: "default", Name: "web"}
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
@@ -409,6 +430,46 @@ func TestReconcileUpdatesLBOnlyWhenNeeded(t *testing.T) {
 			require.NoError(t, c.Get(ctx, key, &svc))
 			require.Len(t, svc.Status.LoadBalancer.Ingress, 1)
 			assert.Equal(t, "198.18.1.2", svc.Status.LoadBalancer.Ingress[0].IP)
+		})
+	}
+}
+
+func TestReconcileUpdatesStatusOnlyWhenNeeded(t *testing.T) {
+	ctx := context.Background()
+	key := types.NamespacedName{Namespace: "default", Name: "web"}
+	vipMode := corev1.LoadBalancerIPModeVIP
+	withIngress := func(ingress ...corev1.LoadBalancerIngress) corev1.ServiceStatus {
+		return corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: ingress}}
+	}
+
+	tests := []struct {
+		name              string
+		status            corev1.ServiceStatus
+		wantStatusUpdates int
+	}{
+		{name: "no ingress yet", status: corev1.ServiceStatus{}, wantStatusUpdates: 1},
+		{name: "same IP (ipMode defaulted by the API server)", status: withIngress(corev1.LoadBalancerIngress{IP: "198.18.1.2", IPMode: &vipMode}), wantStatusUpdates: 0},
+		{name: "other IP", status: withIngress(corev1.LoadBalancerIngress{IP: "198.18.9.9"}), wantStatusUpdates: 1},
+		{name: "extra ingress", status: withIngress(corev1.LoadBalancerIngress{IP: "198.18.1.2"}, corev1.LoadBalancerIngress{IP: "198.18.9.9"}), wantStatusUpdates: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, c, statusUpdates := newReconcileTest(t, &fakeLBAPI{current: fakeLBJSON("10.0.0.11")}, tt.status)
+
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantStatusUpdates, *statusUpdates)
+
+			var svc corev1.Service
+			require.NoError(t, c.Get(ctx, key, &svc))
+			require.Len(t, svc.Status.LoadBalancer.Ingress, 1)
+			assert.Equal(t, "198.18.1.2", svc.Status.LoadBalancer.Ingress[0].IP)
+
+			// A second reconciliation with nothing changed must not write the status again
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantStatusUpdates, *statusUpdates)
 		})
 	}
 }

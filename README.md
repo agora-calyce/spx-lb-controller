@@ -77,6 +77,7 @@ Once assigned (either through the manual annotation or automatic generation), it
 
 ### Updates
 The controller reconciles a service on every change of the service or of its EndpointSlices. It only sends an update to the SPX API when the external load balancer differs from the desired state: product name, VIP, subnet, endpoints (Node internal IPs) or ports (port, protocol, NodePort), compared regardless of their order.
+The service status (`.status.loadBalancer.ingress`) is only written when its IP changes.
 
 ### Cleanup
 When the Kubernetes service is deleted, or if its type changes and it is no longer a `LoadBalancer`, the controller automatically deletes the associated resources (LoadBalancer and EIP) in the external API.
